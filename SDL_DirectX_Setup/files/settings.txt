@@ -1,0 +1,6 @@
+#clear_color
+0 0 0 
+#show_cube
+1
+#show_camera
+1
