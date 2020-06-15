@@ -34,6 +34,11 @@ using Microsoft::WRL::ComPtr;
 // Defines
 #define SCREEN_WIDTH 1366
 #define SCREEN_HEIGHT 800
+#define NUM_SPHERES 256
+
+// Thread stuff
+#define THREAD_GROUP_COUNT        16
+#define THREADS_PER_THREAD_GROUP  16
 
 // D3D11 Stuff
 ComPtr<ID3D11Device> g_Device;
@@ -61,15 +66,12 @@ ComPtr<ID3D11RenderTargetView> g_RenderTargetView;
 D3D11_VIEWPORT g_viewport;
 // D3D11 Stuff
 
-// Compute stuff
-
-// Compute stuff
-
 // Custom struct WorldViewProjection
 struct WorldViewProjection {
 	XMFLOAT4X4 WorldMatrix;
 	XMFLOAT4X4 ViewMatrix;
 	XMFLOAT4X4 ProjectionMatrix;
+	XMFLOAT4 CamPos;
 } WORLD;
 
 struct Instance
@@ -119,9 +121,19 @@ struct DebugSphere
 	ComPtr<ID3D11PixelShader> pixel_shader;
 };
 
+struct ComputePass
+{
+	ComPtr<ID3D11ComputeShader> computeShader;
+
+	ComPtr<ID3D11Buffer> structured_uab;
+	ComPtr<ID3D11Buffer> staging_buffer;
+	ComPtr<ID3D11UnorderedAccessView> uav;
+};
+
 FPSCamera camera;
 Cube cube;
 DebugSphere sphere;
+ComputePass compute_pass;
 WTime timer;
 Input input;
 
@@ -147,6 +159,8 @@ ImVec4 clear_color = ImVec4(0, 0, 0, 1.00f);
 // Forward declarations
 void ConstructCube(Cube& cube, const BYTE* _vs, const BYTE* _ps, int vs_size, int ps_size);
 void ConstructDebugSphere(ComPtr<ID3D11Device> p_device, DebugSphere& dsphere);
+void InitComputePass(ComPtr<ID3D11Device> p_device, ComputePass& pass);
+
 void LoadSettings();
 void SaveSettings();
 float GenRandomFlt(float LO, float HI);
@@ -248,7 +262,7 @@ int main(int argc, char** argv)
 	}
 
 	// Create window
-	SDL_Window* m_window = SDL_CreateWindow("SDLTemplate",
+	SDL_Window* m_window = SDL_CreateWindow("Compute Sandbox",
 		SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
 		SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_SHOWN);
 
@@ -284,8 +298,8 @@ int main(int argc, char** argv)
 	Instance si;
 	ZeroMemory(&si, sizeof(Instance));
 
-	int num_instances = 256;
-	for (int i = 0; i < num_instances; i++)
+	//int num_instances = 256;
+	for (int i = 0; i < NUM_SPHERES; i++)
 	{
 		si.position = GenRandomPosition4(-25, 25, 0, 50, -25, 25);
 		si.color = GenRandomPosition4(0, 1, 0, 1, 0, 1);
@@ -441,6 +455,9 @@ int main(int argc, char** argv)
 	ASSERT_HRESULT_SUCCESS(result);
 	result = g_Device->CreateDepthStencilView(zBuffer.Get(), nullptr, depthStencil.GetAddressOf());
 	ASSERT_HRESULT_SUCCESS(result);
+
+	// Compute pass initialization
+	InitComputePass(g_Device, compute_pass);
 
 	XMFLOAT3 cube_position = XMFLOAT3(0, 0, 0);
 	float rotation_speed = 1;
@@ -603,6 +620,34 @@ int main(int argc, char** argv)
 
 			g_DeviceContext->DrawIndexedInstanced(cube.indices.size(), g_instanceMats.size(), 0, 0, 0);
 			// Draw the cube
+		}
+
+		// Compute pass
+		{
+			g_DeviceContext->CSSetShader(compute_pass.computeShader.Get(), nullptr, 0);
+			g_DeviceContext->CSSetUnorderedAccessViews(0, 1, compute_pass.uav.GetAddressOf(), nullptr);
+
+			// Update sub resource
+			g_DeviceContext->UpdateSubresource(compute_pass.structured_uab.Get(), 0, NULL, g_sphere_instanceMats.data(), 0, 0);
+
+			// Send time
+			WORLD.CamPos.w = static_cast<float>(time_elapsed);
+			// Send the matrix to constant buffer
+			D3D11_MAPPED_SUBRESOURCE gpuBuffer;
+			HRESULT result = g_DeviceContext->Map(constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &gpuBuffer);
+			memcpy(gpuBuffer.pData, &WORLD, sizeof(WORLD));
+			g_DeviceContext->Unmap(constantBuffer.Get(), 0);
+
+			// Connect constant buffer to the pipeline
+			ID3D11Buffer* cbuffers[] = {
+				constantBuffer.Get(),
+			};
+			g_DeviceContext->CSSetConstantBuffers(0, ARRAYSIZE(cbuffers), cbuffers);
+
+			g_DeviceContext->Dispatch(16, 1, 1);
+
+			g_DeviceContext->CopyResource(compute_pass.staging_buffer.Get(), compute_pass.structured_uab.Get());
+			g_DeviceContext->CopyResource(sphereInstanceBuffer.Get(), compute_pass.staging_buffer.Get());
 		}
 		
 		// Sphere
@@ -947,4 +992,74 @@ void ConstructDebugSphere(ComPtr<ID3D11Device> p_device, DebugSphere& dsphere)
 		vshaderbuffer->GetBufferPointer(),
 		vshaderbuffer->GetBufferSize(),
 		dsphere.input_layout.GetAddressOf()));
+}
+
+void InitComputePass(ComPtr<ID3D11Device> p_device, ComputePass& pass)
+{
+	// Shader names
+	std::string sname = "compute_basic";
+	std::string cshadername = sname + "_cs.hlsl";
+
+	std::wstring cshaderw(cshadername.begin(), cshadername.end());
+
+	LPCWSTR cshaderl = cshaderw.c_str();
+
+	// Shader shit
+	ComPtr<ID3D10Blob> cshaderbuffer;
+
+	ComPtr<ID3D10Blob> shader_compile_error;
+
+	// Compile shaders
+	SucceedOrCrash(D3DCompileFromFile(
+		cshaderl,
+		NULL,
+		NULL,
+		"main",
+		"cs_5_0",
+		D3DCOMPILE_DEBUG,
+		0,
+		cshaderbuffer.GetAddressOf(),
+		shader_compile_error.GetAddressOf()));
+
+	// Create shader objects from buffers
+	SucceedOrCrash(p_device->CreateComputeShader(
+		cshaderbuffer->GetBufferPointer(),
+		cshaderbuffer->GetBufferSize(),
+		NULL,
+		pass.computeShader.GetAddressOf()));
+
+	// Structured UAB
+	D3D11_BUFFER_DESC bDesc;
+	D3D11_SUBRESOURCE_DATA subdata;
+	ZeroMemory(&bDesc, sizeof(D3D11_BUFFER_DESC));
+	ZeroMemory(&subdata, sizeof(D3D11_SUBRESOURCE_DATA));
+
+	bDesc.Usage = D3D11_USAGE_DEFAULT;
+	bDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+	bDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+	bDesc.ByteWidth = sizeof(inst_packet) * g_sphere_instanceMats.size();
+	bDesc.StructureByteStride = sizeof(inst_packet);
+	bDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+	subdata.pSysMem = g_sphere_instanceMats.data();
+
+	SucceedOrCrash(p_device->CreateBuffer(&bDesc, nullptr, pass.structured_uab.GetAddressOf()));
+
+	bDesc.Usage = D3D11_USAGE_STAGING;
+	bDesc.BindFlags = 0;
+	bDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+	bDesc.MiscFlags = 0;
+
+	SucceedOrCrash(p_device->CreateBuffer(&bDesc, nullptr, pass.staging_buffer.GetAddressOf()));
+
+	// Create an unordered access view
+	D3D11_UNORDERED_ACCESS_VIEW_DESC desc;
+	ZeroMemory(&desc, sizeof(D3D11_UNORDERED_ACCESS_VIEW_DESC));
+	desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+	desc.Buffer.FirstElement = 0;
+	// This is a Structured Buffer
+	desc.Format = DXGI_FORMAT_R32_TYPELESS;       // Format must be must be DXGI_FORMAT_UNKNOWN, when creating a View of a Structured Buffer
+	desc.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+	desc.Buffer.NumElements = bDesc.ByteWidth / 4;
+
+	SucceedOrCrash(p_device->CreateUnorderedAccessView(pass.structured_uab.Get(), &desc, pass.uav.GetAddressOf()));
 }

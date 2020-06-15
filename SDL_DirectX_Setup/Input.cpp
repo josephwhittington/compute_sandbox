@@ -9,6 +9,8 @@ bool Input::ProcessInput(float dt)
 
 		if (e.type == SDL_KEYDOWN)
 		{
+			if (e.key.keysym.scancode == SDL_SCANCODE_ESCAPE) return false;
+
 			m_keys[e.key.keysym.scancode] = true;
 			m_key_hold_time[e.key.keysym.scancode] += dt;
 		}

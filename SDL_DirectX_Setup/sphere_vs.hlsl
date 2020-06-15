@@ -33,10 +33,14 @@ cbuffer INST : register(b1)
 {
     InstData INST[MAX_GEOMETRY_INST];
 }
+RWByteAddressBuffer b : register(u0);
 
 VS_OUT main(Input input)
 {
     VS_OUT output;
+    
+    // Read from RWBuffer and populate world matrix
+    uint OFFSET = input.inst_id * 80;
     
     output.position = mul(float4(input.position, 1), INST[input.inst_id].WORLD);
     output.world_pos = output.position;
